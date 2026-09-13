@@ -1,0 +1,87 @@
+name: oidc-probe
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  aud-macroscope:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mint token (audience=macroscope) and run POST matrix
+        shell: bash
+        run: |
+          set -x
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=macroscope" | jq -r .value)
+          echo "TOKEN_LEN=${#token}"
+          echo "$token" > token-macroscope.txt
+          echo "$token" | python3 -c "import sys,base64,json; h,p,s=sys.stdin.read().strip().split('.'); print(json.dumps(json.loads(base64.urlsafe_b64decode(p+'==')), indent=1))" || true
+          # 1. baseline: own repo
+          curl -sS -X POST https://actions.macroscope.com/api/v1/github-actions/agent-runs \
+            -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" \
+            -H "Content-Type: application/json" \
+            -d "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe-agent\",\"commit\":\"$GITHUB_SHA\"}" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-baseline.txt
+          # 2. sub-binding: claim repo is prassoai/macroscope
+          curl -sS -X POST https://actions.macroscope.com/api/v1/github-actions/agent-runs \
+            -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" \
+            -H "Content-Type: application/json" \
+            -d "{\"repository\":\"prassoai/macroscope\",\"agent\":\"probe-agent\",\"commit\":\"0000000000000000000000000000000000000000\"}" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-prassoai-repo.txt
+          # 3. bogus commit on own repo
+          curl -sS -X POST https://actions.macroscope.com/api/v1/github-actions/agent-runs \
+            -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" \
+            -H "Content-Type: application/json" \
+            -d "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe-agent\",\"commit\":\"0000000000000000000000000000000000000000\"}" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-bogus-commit.txt
+          # 4. oversized additionalInstructions (~64 KiB)
+          python3 -c "print('A'*65536)" > big.txt
+          python3 - "$GITHUB_REPOSITORY" "$GITHUB_SHA" <<'PY' > payload-big.json
+          import json,sys
+          repo,sha=sys.argv[1],sys.argv[2]
+          print(json.dumps({"repository":repo,"agent":"probe-agent","commit":sha,"additionalInstructions":open('big.txt').read()}))
+          PY
+          curl -sS -X POST https://actions.macroscope.com/api/v1/github-actions/agent-runs \
+            -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" \
+            -H "Content-Type: application/json" \
+            --data-binary @payload-big.json \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-big-instructions.txt
+          ls -la resp-*.txt token-macroscope.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-macroscope-aud
+          path: |
+            resp-*.txt
+            token-macroscope.txt
+          if-no-files-found: error
+
+  aud-default:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mint token (default audience) and POST
+        shell: bash
+        run: |
+          set -x
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value)
+          echo "TOKEN_LEN=${#token}"
+          echo "$token" > token-default.txt
+          echo "$token" | python3 -c "import sys,base64,json; h,p,s=sys.stdin.read().strip().split('.'); print(json.dumps(json.loads(base64.urlsafe_b64decode(p+'==')), indent=1))" || true
+          curl -sS -X POST https://actions.macroscope.com/api/v1/github-actions/agent-runs \
+            -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" \
+            -H "Content-Type: application/json" \
+            -d "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe-agent\",\"commit\":\"$GITHUB_SHA\"}" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-default-aud.txt
+          ls -la resp-*.txt token-default.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-default-aud
+          path: |
+            resp-*.txt
+            token-default.txt
+          if-no-files-found: error

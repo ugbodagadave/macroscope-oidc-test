@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   aud-macroscope:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, probe]
     steps:
       - uses: actions/checkout@v4
       - name: Mint token (audience=macroscope) and run POST matrix
@@ -61,7 +61,7 @@ jobs:
           if-no-files-found: error
 
   aud-default:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, probe]
     steps:
       - uses: actions/checkout@v4
       - name: Mint token (default audience) and POST

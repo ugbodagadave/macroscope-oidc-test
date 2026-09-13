@@ -1,0 +1,24 @@
+name: mint-only
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  mint:
+    runs-on: [self-hosted, probe]
+    steps:
+      - name: Mint token and stash outside workdir
+        shell: bash
+        run: |
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=macroscope" | jq -r .value)
+          echo "$token" > /home/dave/security-research/macroscope/data/oidc-probe/fresh-token.txt
+          echo "stashed len=${#token}"
+          # also probe X-Macroscope-Action-Version absence on POST here (fresh token)
+          curl -sS -X POST https://actions.macroscope.com/api/v1/github-actions/agent-runs \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            -d "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$(git rev-parse HEAD 2>/dev/null || echo a995f85)\"}" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" | tee /home/dave/security-research/macroscope/data/oidc-probe/resp-nover-create.txt

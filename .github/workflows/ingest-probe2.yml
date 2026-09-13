@@ -1,0 +1,66 @@
+name: ingest-probe2
+on: [workflow_dispatch]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  probe2:
+    runs-on: [self-hosted, probe]
+    steps:
+      - name: Mint OIDC token
+        id: oidc
+        run: |
+          OIDC_TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=murmur-webhook" | jq -r '.value')
+          echo "OIDC_TOKEN=$OIDC_TOKEN" >> "$GITHUB_ENV"
+          echo "SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
+      - name: T6 junk repo_token correct repo
+        run: |
+          PAYLOAD=$(jq -nc --argjson github_event '{"after":"abc"}' \
+            --arg event_name "push" --arg repo "ugbodagadave/macroscope-oidc-test" \
+            --arg repo_token "not-a-real-token" --arg branch "main" --arg sha "$GITHUB_SHA" --arg files "" \
+            --arg issue_number "" --arg actor "ugbodagadave" \
+            '{github_event:$github_event,event_name:$event_name,repo:$repo,repo_token:$repo_token,branch:$branch,sha:$sha,files:$files,issue_number:$issue_number,actor:$actor}')
+          HTTP_CODE=$(curl -sS -o /tmp/r6.json -w "%{http_code}" -X POST "https://webhook.murmur.dev/ingest" \
+            -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" -d "$PAYLOAD")
+          echo "T6 code=$HTTP_CODE body=$(cat /tmp/r6.json)"
+      - name: T7 valid GITHUB_TOKEN repo_token
+        run: |
+          PAYLOAD=$(jq -nc --argjson github_event '{"after":"abc"}' \
+            --arg event_name "push" --arg repo "ugbodagadave/macroscope-oidc-test" \
+            --arg repo_token "${{ secrets.GITHUB_TOKEN }}" --arg branch "main" --arg sha "$GITHUB_SHA" --arg files "" \
+            --arg issue_number "" --arg actor "ugbodagadave" \
+            '{github_event:$github_event,event_name:$event_name,repo:$repo,repo_token:$repo_token,branch:$branch,sha:$sha,files:$files,issue_number:$issue_number,actor:$actor}')
+          HTTP_CODE=$(curl -sS -o /tmp/r7.json -w "%{http_code}" -X POST "https://webhook.murmur.dev/ingest" \
+            -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" -d "$PAYLOAD")
+          echo "T7 code=$HTTP_CODE body=$(cat /tmp/r7.json)"
+      - name: T8 issues event with issue_number
+        run: |
+          PAYLOAD=$(jq -nc --argjson github_event '{"action":"opened"}' \
+            --arg event_name "issues" --arg repo "ugbodagadave/macroscope-oidc-test" \
+            --arg repo_token "${{ secrets.GITHUB_TOKEN }}" --arg branch "" --arg sha "" --arg files "" \
+            --arg issue_number "1" --arg actor "ugbodagadave" \
+            '{github_event:$github_event,event_name:$event_name,repo:$repo,repo_token:$repo_token,branch:$branch,sha:$sha,files:$files,issue_number:$issue_number,actor:$actor}')
+          HTTP_CODE=$(curl -sS -o /tmp/r8.json -w "%{http_code}" -X POST "https://webhook.murmur.dev/ingest" \
+            -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" -d "$PAYLOAD")
+          echo "T8 code=$HTTP_CODE body=$(cat /tmp/r8.json)"
+      - name: T9 repo normalization variants
+        run: |
+          for r in "ugbodagadave/macroscope-oidc-test/" "UGbodagadave/macroscope-oidc-test" "ugbodagadave/macroscope-oidc-test/../macroscope-oidc-test" "ugbodagadave/macroscope-oidc-test@x" "ugbodagadave/macroscope-oidc-test.git"; do
+            PAYLOAD=$(jq -nc --argjson github_event '{}' --arg event_name "push" --arg repo "$r" \
+              --arg repo_token "junk" --arg branch "main" --arg sha "abc" --arg files "" \
+              --arg issue_number "" --arg actor "ugbodagadave" \
+              '{github_event:$github_event,event_name:$event_name,repo:$repo,repo_token:$repo_token,branch:$branch,sha:$sha,files:$files,issue_number:$issue_number,actor:$actor}')
+            HTTP_CODE=$(curl -sS -o /tmp/r9.json -w "%{http_code}" -X POST "https://webhook.murmur.dev/ingest" \
+              -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" -d "$PAYLOAD")
+            echo "T9 repo='$r' code=$HTTP_CODE body=$(cat /tmp/r9.json)"
+          done
+      - name: T10 empty repo_token
+        run: |
+          PAYLOAD=$(jq -nc --argjson github_event '{}' --arg event_name "push" --arg repo "ugbodagadave/macroscope-oidc-test" \
+            --arg repo_token "" --arg branch "main" --arg sha "abc" --arg files "" \
+            --arg issue_number "" --arg actor "ugbodagadave" \
+            '{github_event:$github_event,event_name:$event_name,repo:$repo,repo_token:$repo_token,branch:$branch,sha:$sha,files:$files,issue_number:$issue_number,actor:$actor}')
+          HTTP_CODE=$(curl -sS -o /tmp/r10.json -w "%{http_code}" -X POST "https://webhook.murmur.dev/ingest" \
+            -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" -d "$PAYLOAD")
+          echo "T10 code=$HTTP_CODE body=$(cat /tmp/r10.json)"

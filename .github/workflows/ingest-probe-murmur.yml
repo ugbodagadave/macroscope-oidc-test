@@ -5,7 +5,7 @@ permissions:
   contents: read
 jobs:
   probe:
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, probe]
     steps:
       - name: Mint OIDC token (aud=murmur-webhook)
         id: oidc

